@@ -1,0 +1,476 @@
+import SwiftUI
+import PhotosUI
+import AVFoundation
+import UniformTypeIdentifiers
+import QuickLook
+
+struct PendingMediaItem: Identifiable, Equatable {
+    let id = UUID()
+    let type: MediaType
+    let image: UIImage?
+    let videoURL: URL?
+    let fileURL: URL?
+    let fileName: String
+
+    static func == (lhs: PendingMediaItem, rhs: PendingMediaItem) -> Bool {
+        lhs.id == rhs.id
+    }
+}
+
+struct MediaComposerSheet: View {
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var items: [PendingMediaItem]
+    @State private var caption: String = ""
+
+    @State private var photoPickerItems: [PhotosPickerItem] = []
+    @State private var showCamera = false
+    @State private var cameraItems: [PendingMediaItem] = []
+    @State private var showFileImporter = false
+    @State private var isLoadingPickerItems = false
+    @State private var isSending = false
+
+    let onSend: (String, [PendingMediaItem]) -> Void
+
+    init(initialItems: [PendingMediaItem],
+         onSend: @escaping (String, [PendingMediaItem]) -> Void) {
+        _items = State(initialValue: initialItems)
+        self.onSend = onSend
+    }
+
+    var body: some View {
+        NavigationView {
+            VStack(spacing: 0) {
+                if items.isEmpty {
+                    emptyState
+                } else {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 16) {
+                            mediaGridSection
+                            filesSection
+                            captionSection
+                        }
+                        .padding(.vertical)
+                    }
+                }
+
+                Divider()
+                bottomBar
+            }
+            .navigationTitle("Отправка")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Закрыть") {
+                        if !isSending && !isLoadingPickerItems {
+                            dismiss()
+                        }
+                    }
+                    .disabled(isSending || isLoadingPickerItems)
+                }
+            }
+        }
+        .interactiveDismissDisabled(isSending || isLoadingPickerItems)
+        .sheet(isPresented: $showCamera, onDismiss: handleCameraItems) {
+            CameraPicker(items: $cameraItems)
+        }
+        .onChange(of: photoPickerItems) { newValue in
+            guard !newValue.isEmpty else { return }
+            loadPhotosPickerItems(newValue)
+        }
+        .fileImporter(
+            isPresented: $showFileImporter,
+            allowedContentTypes: [.item],
+            allowsMultipleSelection: true
+        ) { result in
+            handleFileImport(result)
+        }
+    }
+
+    // MARK: - Sections
+
+    private var emptyState: some View {
+        VStack(spacing: 12) {
+            Spacer()
+
+            Image(systemName: "paperclip")
+                .font(.system(size: 44))
+                .foregroundColor(.secondary)
+
+            Text("Нет вложений")
+                .font(.headline)
+
+            Text("Добавь фото, видео или файл")
+                .font(.subheadline)
+                .foregroundColor(.secondary)
+
+            Spacer()
+        }
+        .frame(maxWidth: .infinity)
+    }
+
+    private var mediaGridSection: some View {
+        let visualItems = items.filter { $0.type == .image || $0.type == .video }
+
+        return Group {
+            if !visualItems.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Медиа")
+                        .font(.headline)
+                        .padding(.horizontal)
+
+                    LazyVGrid(
+                        columns: [GridItem(.adaptive(minimum: 110), spacing: 10)],
+                        spacing: 10
+                    ) {
+                        ForEach(visualItems) { item in
+                            ZStack(alignment: .topTrailing) {
+                                MediaComposerTile(item: item)
+
+                                Button {
+                                    removeItem(item)
+                                } label: {
+                                    Image(systemName: "xmark.circle.fill")
+                                        .font(.system(size: 22))
+                                        .foregroundColor(.white)
+                                        .background(Color.black.opacity(0.45))
+                                        .clipShape(Circle())
+                                }
+                                .padding(6)
+                                .disabled(isSending || isLoadingPickerItems)
+                            }
+                        }
+                    }
+                    .padding(.horizontal)
+                }
+            }
+        }
+    }
+
+    private var filesSection: some View {
+        let fileItems = items.filter { $0.type == .file }
+
+        return Group {
+            if !fileItems.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Файлы")
+                        .font(.headline)
+                        .padding(.horizontal)
+
+                    VStack(spacing: 8) {
+                        ForEach(fileItems) { item in
+                            HStack(spacing: 12) {
+                                Image(systemName: "doc.fill")
+                                    .font(.system(size: 20))
+                                    .foregroundColor(.blue)
+
+                                Text(item.fileName)
+                                    .font(.subheadline)
+                                    .lineLimit(2)
+
+                                Spacer()
+
+                                Button {
+                                    removeItem(item)
+                                } label: {
+                                    Image(systemName: "trash")
+                                        .foregroundColor(.red)
+                                }
+                                .disabled(isSending || isLoadingPickerItems)
+                            }
+                            .padding(12)
+                            .background(Color(.secondarySystemBackground))
+                            .cornerRadius(12)
+                        }
+                    }
+                    .padding(.horizontal)
+                }
+            }
+        }
+    }
+
+    private var captionSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Подпись")
+                .font(.headline)
+
+            TextField("Добавить подпись", text: $caption, axis: .vertical)
+                .textFieldStyle(.roundedBorder)
+                .lineLimit(3...6)
+                .disabled(isSending || isLoadingPickerItems)
+        }
+        .padding(.horizontal)
+        .padding(.top, 8)
+    }
+
+    private var bottomBar: some View {
+        VStack(spacing: 10) {
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 12) {
+                    Button {
+                        showCamera = true
+                    } label: {
+                        composerAddButton(title: "Камера", systemImage: "camera.fill")
+                    }
+                    .disabled(isSending || isLoadingPickerItems)
+
+                    PhotosPicker(
+                        selection: $photoPickerItems,
+                        maxSelectionCount: 20,
+                        matching: .any(of: [.images, .videos])
+                    ) {
+                        composerAddButton(title: "Галерея", systemImage: "photo.on.rectangle")
+                    }
+                    .disabled(isSending || isLoadingPickerItems)
+
+                    Button {
+                        showFileImporter = true
+                    } label: {
+                        composerAddButton(title: "Файл", systemImage: "doc")
+                    }
+                    .disabled(isSending || isLoadingPickerItems)
+                }
+                .padding(.horizontal)
+            }
+
+            Button {
+                guard !items.isEmpty else { return }
+                isSending = true
+                let trimmedCaption = caption.trimmingCharacters(in: .whitespacesAndNewlines)
+                onSend(trimmedCaption, items)
+                dismiss()
+            } label: {
+                HStack {
+                    if isLoadingPickerItems {
+                        ProgressView()
+                            .tint(.white)
+                    }
+                    Text(isLoadingPickerItems ? "Загрузка..." : "Отправить")
+                        .font(.headline)
+                        .foregroundColor(.white)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 14)
+                .background(items.isEmpty || isLoadingPickerItems ? Color.gray : Color.blue)
+                .cornerRadius(14)
+                .padding(.horizontal)
+                .padding(.bottom, 8)
+            }
+            .disabled(items.isEmpty || isLoadingPickerItems || isSending)
+        }
+        .padding(.top, 10)
+        .background(Color(.systemBackground))
+    }
+
+    // MARK: - Helpers
+
+    private func composerAddButton(title: String, systemImage: String) -> some View {
+        HStack(spacing: 8) {
+            Image(systemName: systemImage)
+            Text(title)
+                .font(.subheadline)
+        }
+        .foregroundColor(.blue)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(Color.blue.opacity(0.12))
+        .cornerRadius(12)
+    }
+
+    private func removeItem(_ item: PendingMediaItem) {
+        items.removeAll { $0.id == item.id }
+    }
+
+    private func handleCameraItems() {
+        guard !cameraItems.isEmpty else { return }
+        items.append(contentsOf: cameraItems)
+        cameraItems = []
+    }
+
+    private func handleFileImport(_ result: Result<[URL], Error>) {
+        switch result {
+        case .success(let urls):
+            let mapped = urls.compactMap { importedURL -> PendingMediaItem? in
+                let secured = importedURL.startAccessingSecurityScopedResource()
+                defer {
+                    if secured {
+                        importedURL.stopAccessingSecurityScopedResource()
+                    }
+                }
+
+                let fileName = importedURL.lastPathComponent
+                let tempURL = FileManager.default.temporaryDirectory
+                    .appendingPathComponent(UUID().uuidString + "-" + fileName)
+
+                do {
+                    if FileManager.default.fileExists(atPath: tempURL.path) {
+                        try FileManager.default.removeItem(at: tempURL)
+                    }
+                    try FileManager.default.copyItem(at: importedURL, to: tempURL)
+
+                    return PendingMediaItem(
+                        type: .file,
+                        image: nil,
+                        videoURL: nil,
+                        fileURL: tempURL,
+                        fileName: fileName
+                    )
+                } catch {
+                    print("❌ Failed to copy imported file: \(error.localizedDescription)")
+                    return nil
+                }
+            }
+
+            items.append(contentsOf: mapped)
+
+        case .failure(let error):
+            print("❌ File import error: \(error.localizedDescription)")
+        }
+    }
+
+    private func loadPhotosPickerItems(_ pickerItems: [PhotosPickerItem]) {
+        isLoadingPickerItems = true
+
+        Task {
+            var loaded: [PendingMediaItem] = []
+
+            for pickerItem in pickerItems {
+                // Сначала пробуем видео через Transferable
+                if let movie = try? await pickerItem.loadTransferable(type: MovieTransferable.self) {
+                    loaded.append(
+                        PendingMediaItem(
+                            type: .video,
+                            image: nil,
+                            videoURL: movie.url,
+                            fileURL: nil,
+                            fileName: movie.url.lastPathComponent
+                        )
+                    )
+                    continue
+                }
+
+                // Потом пробуем как Data -> UIImage (фото)
+                if let data = try? await pickerItem.loadTransferable(type: Data.self),
+                   let image = UIImage(data: data) {
+                    let name = suggestedFileName(from: pickerItem, fallback: "image.jpg")
+                    loaded.append(
+                        PendingMediaItem(
+                            type: .image,
+                            image: image,
+                            videoURL: nil,
+                            fileURL: nil,
+                            fileName: name
+                        )
+                    )
+                    continue
+                }
+            }
+
+            await MainActor.run {
+                items.append(contentsOf: loaded)
+                photoPickerItems = []
+                isLoadingPickerItems = false
+            }
+        }
+    }
+
+    private func suggestedFileName(from item: PhotosPickerItem, fallback: String) -> String {
+        item.itemIdentifier ?? fallback
+    }
+}
+
+// MARK: - Tile
+
+struct MediaComposerTile: View {
+    let item: PendingMediaItem
+
+    var body: some View {
+        ZStack {
+            if item.type == .image, let image = item.image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+            } else if item.type == .video, let url = item.videoURL {
+                VideoComposerThumbnail(url: url)
+
+                Image(systemName: "play.circle.fill")
+                    .font(.system(size: 34))
+                    .foregroundColor(.white)
+                    .shadow(radius: 4)
+            } else {
+                Color.black.opacity(0.08)
+            }
+        }
+        .frame(height: 120)
+        .frame(maxWidth: .infinity)
+        .clipped()
+        .background(Color(.secondarySystemBackground))
+        .cornerRadius(14)
+    }
+}
+
+// MARK: - Video thumbnail helper
+
+private struct VideoComposerThumbnail: View {
+    let url: URL
+    @State private var image: UIImage?
+
+    var body: some View {
+        Group {
+            if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFill()
+            } else {
+                Color.black.opacity(0.15)
+                    .overlay(
+                        ProgressView()
+                            .tint(.white)
+                    )
+            }
+        }
+        .task {
+            guard image == nil else { return }
+            image = generateThumbnail(for: url)
+        }
+    }
+
+    private func generateThumbnail(for url: URL) -> UIImage? {
+        let asset = AVURLAsset(url: url)
+        let generator = AVAssetImageGenerator(asset: asset)
+        generator.appliesPreferredTrackTransform = true
+        generator.maximumSize = CGSize(width: 400, height: 400)
+
+        do {
+            let cgImage = try generator.copyCGImage(
+                at: CMTime(seconds: 0.1, preferredTimescale: 600),
+                actualTime: nil
+            )
+            return UIImage(cgImage: cgImage)
+        } catch {
+            return nil
+        }
+    }
+}
+
+// MARK: - MovieTransferable
+
+struct MovieTransferable: Transferable {
+    let url: URL
+
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(contentType: .movie) { movie in
+            SentTransferredFile(movie.url)
+        } importing: { received in
+            let copyURL = FileManager.default.temporaryDirectory
+                .appendingPathComponent(UUID().uuidString + "-" + received.file.lastPathComponent)
+
+            if FileManager.default.fileExists(atPath: copyURL.path) {
+                try? FileManager.default.removeItem(at: copyURL)
+            }
+
+            try FileManager.default.copyItem(at: received.file, to: copyURL)
+            return MovieTransferable(url: copyURL)
+        }
+    }
+}
